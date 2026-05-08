@@ -1,0 +1,9 @@
+<launch>
+    <arg name="pkg_name"  default="encoder_pose"      doc="name of the package"/>
+    <arg name="node_name" default="encoder_pose_node"  doc="name of the node"/>
+    <arg name="veh"       doc="Name of vehicle, e.g. megaman"/>
+
+    <group ns="$(arg veh)">
+        <node pkg="$(arg pkg_name)" type="$(arg node_name).py" name="$(arg node_name)" output="screen" required="true"/>
+    </group>
+</launch>
