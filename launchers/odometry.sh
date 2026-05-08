@@ -5,14 +5,11 @@ source /environment.sh
 # initialize launch file
 dt-launchfile-init
 
-# YOUR CODE BELOW THIS LINE
 # ----------------------------------------------------------------------------
 
 dt-exec roslaunch --wait encoder_pose encoder_pose_node.launch veh:=$VEHICLE_NAME
-dt-exec roslaunch --wait visual_slam visual_slam_node.launch veh:=$VEHICLE_NAME
 
 # ----------------------------------------------------------------------------
-# YOUR CODE ABOVE THIS LINE
 
 # wait for app to end
 dt-launchfile-join
