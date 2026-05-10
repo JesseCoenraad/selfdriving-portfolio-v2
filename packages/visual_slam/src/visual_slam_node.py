@@ -4,9 +4,10 @@ from typing import List, Dict, Optional
 import cv2
 import numpy as np
 import rospy
+import tf2_ros
 from duckietown.dtros import DTROS, NodeType, TopicType
 from sensor_msgs.msg import CompressedImage
-from geometry_msgs.msg import PoseStamped, Point
+from geometry_msgs.msg import PoseStamped, Point, TransformStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import ColorRGBA
 
@@ -61,7 +62,7 @@ class VisualSlamNode(DTROS):
         self.veh = rospy.get_namespace().strip("/")
 
         self.K = self._load_camera_matrix()
-        self.tracker  = FeatureTracker()
+        self.tracker   = FeatureTracker()
         self.estimator = MotionEstimator(self.K)
         self.detector  = ObjectDetector()
 
@@ -71,6 +72,8 @@ class VisualSlamNode(DTROS):
         self.pose = np.eye(4, dtype=np.float64)   # accumulated camera pose in world frame
         self.map_features: List[List[float]] = []  # [x, y, z] world points
         self.map_objects:  List[Dict]        = []  # {type, position}
+
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster()
 
         rospy.Subscriber(
             f"/{self.veh}/camera_node/image/compressed",
@@ -118,7 +121,8 @@ class VisualSlamNode(DTROS):
             self._add_features(curr_good)
             self._add_objects(objects)
             self._publish_pose(msg.header.stamp)
-            self._publish_map()
+
+        self._publish_map()
 
         # Re-detect features when count drops below threshold
         if self.tracker.needs_redetect(curr_good):
@@ -185,6 +189,23 @@ class VisualSlamNode(DTROS):
         msg.pose.orientation.z = q[2]
         msg.pose.orientation.w = q[3]
         self.pub_pose.publish(msg)
+        self._broadcast_tf(stamp)
+
+    def _broadcast_tf(self, stamp):
+        t = TransformStamped()
+        t.header.stamp    = stamp
+        t.header.frame_id = "map"
+        t.child_frame_id  = f"{self.veh}/base_link"
+        p = self.pose[:3, 3]
+        t.transform.translation.x = p[0]
+        t.transform.translation.y = p[1]
+        t.transform.translation.z = p[2]
+        q = self._rot_to_quat(self.pose[:3, :3])
+        t.transform.rotation.x = q[0]
+        t.transform.rotation.y = q[1]
+        t.transform.rotation.z = q[2]
+        t.transform.rotation.w = q[3]
+        self.tf_broadcaster.sendTransform(t)
 
     def _publish_map(self):
         markers = MarkerArray()
