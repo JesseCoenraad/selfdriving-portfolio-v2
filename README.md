@@ -14,31 +14,6 @@ to tools and libraries defined in
 ROS, check out [this template](https://github.com/duckietown/template-basic).
 
 
-## Viewing the Duckiebot GUI (noVNC)
-
-To view the graphical interface of your Duckiebot remotely, run:
-
-```bash
-dts start_gui_tools --vnc <robot-name>
-```
-
-Replace `<robot-name>` with the hostname of your Duckiebot (e.g. `myduckiebot`).
-
-Once running, open the noVNC interface in your browser. **If `http://localhost:8087` does not work**, use your machine's hostname URL instead:
-
-```
-http://<your-hostname>.local:8087
-```
-
-or try:
-
-```
-http://127.0.0.1:8087
-```
-
-Your hostname is shown in the terminal output when starting the tool (e.g. `jesse-coenraad-ThinkBook-15-G3-ACL.local:8087`).
-
-
 ## How to use it
 
 ### 1. Fork this repository
