@@ -7,8 +7,11 @@ import numpy as np
 import rospy
 import std_msgs.msg
 from duckietown.dtros import DTROS, NodeType
+from geometry_msgs.msg import Point
 from sensor_msgs import point_cloud2 as pc2
 from sensor_msgs.msg import CameraInfo, CompressedImage, PointCloud2, PointField
+from std_msgs.msg import ColorRGBA
+from visualization_msgs.msg import Marker, MarkerArray
 
 
 class VisualSlamNode(DTROS):
@@ -26,7 +29,34 @@ class VisualSlamNode(DTROS):
 
     Publishers:
         /<veh>/slam/point_cloud              (PointCloud2)
+        /<veh>/slam/objects                  (MarkerArray)
     """
+
+    _HSV_RANGES = {
+        "duckie": {
+            "ranges": [(np.array([20, 100, 100]), np.array([35, 255, 255]))],
+            "min_area": 500,
+            "color": ColorRGBA(1.0, 1.0, 0.0, 1.0),
+        },
+        "traffic_light_red": {
+            "ranges": [
+                (np.array([0, 120, 100]), np.array([10, 255, 255])),
+                (np.array([170, 120, 100]), np.array([180, 255, 255])),
+            ],
+            "min_area": 200,
+            "color": ColorRGBA(1.0, 0.1, 0.1, 1.0),
+        },
+        "traffic_light_green": {
+            "ranges": [(np.array([40, 100, 100]), np.array([80, 255, 255]))],
+            "min_area": 200,
+            "color": ColorRGBA(0.1, 1.0, 0.1, 1.0),
+        },
+        "duckiebot": {
+            "ranges": [(np.array([100, 100, 50]), np.array([130, 255, 255]))],
+            "min_area": 800,
+            "color": ColorRGBA(0.1, 0.1, 1.0, 1.0),
+        },
+    }
 
     def __init__(self, node_name: str):
         super().__init__(node_name=node_name, node_type=NodeType.LOCALIZATION)
@@ -58,8 +88,13 @@ class VisualSlamNode(DTROS):
         self._map_pts: list = []
         self._max_pts: int  = rospy.get_param("~max_map_points", 10000)
 
-        self._pc_pub = rospy.Publisher(
+        self._map_objects: list = []
+
+        self._pc_pub  = rospy.Publisher(
             f"/{self.veh}/slam/point_cloud", PointCloud2, queue_size=1
+        )
+        self._obj_pub = rospy.Publisher(
+            f"/{self.veh}/slam/objects", MarkerArray, queue_size=1
         )
 
         rospy.Subscriber(
@@ -85,10 +120,17 @@ class VisualSlamNode(DTROS):
                 self.log("Camera intrinsics loaded from camera_info.")
 
     def _image_cb(self, msg: CompressedImage):
-        buf   = np.frombuffer(msg.data, dtype=np.uint8)
-        frame = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
-        if frame is None:
+        buf        = np.frombuffer(msg.data, dtype=np.uint8)
+        frame_bgr  = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if frame_bgr is None:
             return
+        frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+        # Object detection on every frame
+        objects = self._detect_objects(frame_bgr)
+        if objects:
+            self._add_objects(objects)
+            self._publish_objects()
 
         kp, desc = self._orb.detectAndCompute(frame, None)
         if desc is None or len(kp) < 8:
@@ -110,24 +152,37 @@ class VisualSlamNode(DTROS):
             self._prev_kp, self._prev_desc = kp, desc
             return
 
-        pts1 = np.float32([self._prev_kp[m.queryIdx].pt for m in matches])
-        pts2 = np.float32([kp[m.trainIdx].pt for m in matches])
+        pts1 = np.float32([self._prev_kp[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        pts2 = np.float32([kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
 
-        # Fundamental matrix with RANSAC to filter outliers
-        F, mask = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC)
-        if F is None or mask is None:
+        if pts1.shape[0] < 8 or pts2.shape[0] < 8:
             self._prev_kp, self._prev_desc = kp, desc
             return
 
-        pts1_in = pts1[mask.ravel() == 1]
-        pts2_in = pts2[mask.ravel() == 1]
-        if len(pts1_in) < 5:
+        # Fundamental matrix with RANSAC to filter outliers
+        try:
+            F, mask = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC, 3.0, 0.99)
+        except cv2.error:
+            self._prev_kp, self._prev_desc = kp, desc
+            return
+
+        if F is None or mask is None or F.shape != (3, 3):
+            self._prev_kp, self._prev_desc = kp, desc
+            return
+
+        pts1_in = pts1[mask.ravel() == 1].reshape(-1, 2)
+        pts2_in = pts2[mask.ravel() == 1].reshape(-1, 2)
+        if len(pts1_in) < 8:
             self._prev_kp, self._prev_desc = kp, desc
             return
 
         # Essential matrix → relative pose
-        E = K.T @ F @ K
-        _, R, t, _ = cv2.recoverPose(E, pts1_in, pts2_in, K)
+        try:
+            E = K.T @ F @ K
+            _, R, t, _ = cv2.recoverPose(E, pts1_in, pts2_in, K)
+        except cv2.error:
+            self._prev_kp, self._prev_desc = kp, desc
+            return
 
         # Triangulate in the previous camera frame
         p1_n = cv2.undistortPoints(pts1_in.reshape(-1, 1, 2), K, None).reshape(-1, 2)
@@ -161,6 +216,64 @@ class VisualSlamNode(DTROS):
         self._R_cw = R_cw_new
 
         self._prev_kp, self._prev_desc = kp, desc
+
+    def _detect_objects(self, frame_bgr: np.ndarray) -> list:
+        hsv     = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        results = []
+        for label, cfg in self._HSV_RANGES.items():
+            mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+            for lo, hi in cfg["ranges"]:
+                mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lo, hi))
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                if cv2.contourArea(cnt) < cfg["min_area"]:
+                    continue
+                M = cv2.moments(cnt)
+                if M["m00"] == 0:
+                    continue
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                results.append({"type": label, "pixel": (cx, cy)})
+        return results
+
+    def _add_objects(self, detections: list):
+        with self._K_lock:
+            K = self._K if self._K is not None else self._default_K
+        cam_pos = self._t_cw.ravel()
+        for obj in detections:
+            px, py = obj["pixel"]
+            p_c = np.array([
+                (px - K[0, 2]) / K[0, 0],
+                (py - K[1, 2]) / K[1, 1],
+                1.0,
+            ])
+            p_w = self._R_cw @ p_c + cam_pos
+            self._map_objects.append({"type": obj["type"], "position": p_w.tolist()})
+        if len(self._map_objects) > 500:
+            self._map_objects = self._map_objects[-500:]
+
+    def _publish_objects(self):
+        markers = MarkerArray()
+        now     = rospy.Time.now()
+        for i, obj in enumerate(self._map_objects[-100:]):
+            p     = obj["position"]
+            label = obj["type"]
+            color = self._HSV_RANGES[label]["color"]
+            m = Marker()
+            m.header.stamp       = now
+            m.header.frame_id    = "map"
+            m.ns                 = "objects"
+            m.id                 = i
+            m.type               = Marker.SPHERE
+            m.action             = Marker.ADD
+            m.pose.position.x    = p[0]
+            m.pose.position.y    = p[1]
+            m.pose.position.z    = p[2]
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = 0.15
+            m.color  = color
+            markers.markers.append(m)
+        self._obj_pub.publish(markers)
 
     def _publish_cloud(self):
         with self._map_lock:
