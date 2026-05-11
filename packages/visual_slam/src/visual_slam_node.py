@@ -34,26 +34,26 @@ class VisualSlamNode(DTROS):
 
     _HSV_RANGES = {
         "duckie": {
-            "ranges": [(np.array([20, 100, 100]), np.array([35, 255, 255]))],
-            "min_area": 500,
+            "ranges": [(np.array([15, 80, 80]), np.array([40, 255, 255]))],
+            "min_area": 150,
             "color": ColorRGBA(1.0, 1.0, 0.0, 1.0),
         },
         "traffic_light_red": {
             "ranges": [
-                (np.array([0, 120, 100]), np.array([10, 255, 255])),
-                (np.array([170, 120, 100]), np.array([180, 255, 255])),
+                (np.array([0, 80, 80]), np.array([15, 255, 255])),
+                (np.array([165, 80, 80]), np.array([180, 255, 255])),
             ],
-            "min_area": 200,
+            "min_area": 100,
             "color": ColorRGBA(1.0, 0.1, 0.1, 1.0),
         },
         "traffic_light_green": {
-            "ranges": [(np.array([40, 100, 100]), np.array([80, 255, 255]))],
-            "min_area": 200,
+            "ranges": [(np.array([35, 80, 80]), np.array([85, 255, 255]))],
+            "min_area": 100,
             "color": ColorRGBA(0.1, 1.0, 0.1, 1.0),
         },
         "duckiebot": {
-            "ranges": [(np.array([100, 100, 50]), np.array([130, 255, 255]))],
-            "min_area": 800,
+            "ranges": [(np.array([95, 80, 50]), np.array([135, 255, 255]))],
+            "min_area": 300,
             "color": ColorRGBA(0.1, 0.1, 1.0, 1.0),
         },
     }
@@ -110,6 +110,9 @@ class VisualSlamNode(DTROS):
             queue_size=1,
             buff_size=2 ** 24,
         )
+
+        rospy.Timer(rospy.Duration(1.0), lambda _: self._publish_cloud())
+        rospy.Timer(rospy.Duration(1.0), lambda _: self._publish_objects())
 
         self.log("Initialized.")
 

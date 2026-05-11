@@ -1,0 +1,14 @@
+version: 1.0
+scripts:
+  map_0/duckie_0:
+    scripts:
+      - straight_line_script
+  map_0/duckie_1:
+    scripts:
+      - straight_line_script
+  map_0/duckie_2:
+    scripts:
+      - straight_line_script
+  map_0/duckie_3:
+    scripts:
+      - straight_line_script
