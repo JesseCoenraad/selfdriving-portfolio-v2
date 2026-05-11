@@ -1,323 +1,181 @@
 #!/usr/bin/env python3
-from typing import List, Dict, Optional
+
+import threading
 
 import cv2
 import numpy as np
 import rospy
-import tf2_ros
-from duckietown.dtros import DTROS, NodeType, TopicType
-from sensor_msgs.msg import CompressedImage
-from geometry_msgs.msg import PoseStamped, Point, TransformStamped
-from visualization_msgs.msg import Marker, MarkerArray
-from std_msgs.msg import ColorRGBA
-
-from visual_slam.include.slam.feature_tracker import FeatureTracker
-from visual_slam.include.slam.motion_estimator import MotionEstimator
-from visual_slam.include.slam.object_detector import ObjectDetector
+import std_msgs.msg
+from duckietown.dtros import DTROS, NodeType
+from sensor_msgs import point_cloud2 as pc2
+from sensor_msgs.msg import CameraInfo, CompressedImage, PointCloud2, PointField
 
 
 class VisualSlamNode(DTROS):
     """
-    Vision-based monocular SLAM node.
+    ORB-SLAM pipeline node.
 
-    Tracks Shi-Tomasi corners via Lucas-Kanade optical flow, estimates
-    relative camera motion via the essential matrix, and builds a live
-    map of feature landmarks and detected Duckietown objects.
-
-    Scale is unit (monocular ambiguity); sensor fusion with odometry
-    resolves metric scale in Task 3.
+    Subscribes to a compressed camera image stream, runs ORB feature extraction
+    and matching on every consecutive pair of frames, estimates relative pose via
+    the essential matrix, triangulates 3-D landmarks, and publishes a growing
+    point cloud on /<veh>/slam/point_cloud.
 
     Subscribers:
         /<veh>/camera_node/image/compressed  (CompressedImage)
+        /<veh>/camera_node/camera_info       (CameraInfo)
 
     Publishers:
-        /<veh>/slam/pose                     (PoseStamped)
-        /<veh>/slam/map                      (MarkerArray)
-        /<veh>/slam/debug/image/compressed   (CompressedImage)
+        /<veh>/slam/point_cloud              (PointCloud2)
     """
-
-    # Duckietown DB21 camera defaults — overridden by calibration if present
-    _DEFAULT_K = np.array(
-        [[313.8, 0.0, 321.5], [0.0, 313.8, 237.5], [0.0, 0.0, 1.0]],
-        dtype=np.float64,
-    )
-
-    _OBJ_COLORS: Dict[str, ColorRGBA] = {
-        "duckie":              ColorRGBA(1.0, 1.0, 0.0, 1.0),
-        "traffic_light_red":   ColorRGBA(1.0, 0.1, 0.1, 1.0),
-        "traffic_light_green": ColorRGBA(0.1, 1.0, 0.1, 1.0),
-    }
-
-    _DBG_COLORS: Dict[str, tuple] = {
-        "duckie":              (0, 255, 255),
-        "traffic_light_red":   (0, 0, 255),
-        "traffic_light_green": (0, 255, 0),
-    }
-
-    MAX_MAP_FEATURES = 2000
-    MAX_MAP_OBJECTS  = 500
 
     def __init__(self, node_name: str):
         super().__init__(node_name=node_name, node_type=NodeType.LOCALIZATION)
         self.veh = rospy.get_namespace().strip("/")
 
-        self.K = self._load_camera_matrix()
-        self.tracker   = FeatureTracker()
-        self.estimator = MotionEstimator(self.K)
-        self.detector  = ObjectDetector()
+        n_features = rospy.get_param("~n_features", 5000)
+        self._orb = cv2.ORB_create(nfeatures=n_features)
+        self._bf  = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-        # SLAM state
-        self.prev_gray: Optional[np.ndarray] = None
-        self.prev_pts:  Optional[np.ndarray] = None
-        self.pose = np.eye(4, dtype=np.float64)   # accumulated camera pose in world frame
-        self.map_features: List[List[float]] = []  # [x, y, z] world points
-        self.map_objects:  List[Dict]        = []  # {type, position}
+        # Camera intrinsics — updated from camera_info when available
+        self._K_lock = threading.Lock()
+        self._K = None
+        k_flat = rospy.get_param(
+            "~camera_matrix",
+            [313.8, 0.0, 321.5, 0.0, 313.8, 237.5, 0.0, 0.0, 1.0],
+        )
+        self._default_K = np.array(k_flat, dtype=np.float64).reshape(3, 3)
 
-        self.tf_broadcaster = tf2_ros.TransformBroadcaster()
+        # Previous-frame ORB state
+        self._prev_kp   = None
+        self._prev_desc = None
 
+        # Accumulated global pose (camera-to-world)
+        self._R_cw = np.eye(3)
+        self._t_cw = np.zeros((3, 1))
+
+        # Map accumulation
+        self._map_lock = threading.Lock()
+        self._map_pts: list = []
+        self._max_pts: int  = rospy.get_param("~max_map_points", 10000)
+
+        self._pc_pub = rospy.Publisher(
+            f"/{self.veh}/slam/point_cloud", PointCloud2, queue_size=1
+        )
+
+        rospy.Subscriber(
+            f"/{self.veh}/camera_node/camera_info",
+            CameraInfo,
+            self._camera_info_cb,
+            queue_size=1,
+        )
         rospy.Subscriber(
             f"/{self.veh}/camera_node/image/compressed",
             CompressedImage,
-            self.cb_image,
+            self._image_cb,
             queue_size=1,
             buff_size=2 ** 24,
         )
 
-        self.pub_pose  = rospy.Publisher(f"/{self.veh}/slam/pose", PoseStamped,  queue_size=1)
-        self.pub_map   = rospy.Publisher(f"/{self.veh}/slam/map",  MarkerArray,  queue_size=1)
-        self.pub_debug = rospy.Publisher(
-            f"/{self.veh}/slam/debug/image/compressed",
-            CompressedImage,
-            queue_size=1,
-            dt_topic_type=TopicType.DEBUG,
-        )
-
         self.log("Initialized.")
 
-    # ------------------------------------------------------------------
-    # Main callback
-    # ------------------------------------------------------------------
+    def _camera_info_cb(self, msg: CameraInfo):
+        with self._K_lock:
+            if self._K is None:
+                self._K = np.array(msg.K, dtype=np.float64).reshape(3, 3)
+                self.log("Camera intrinsics loaded from camera_info.")
 
-    def cb_image(self, msg: CompressedImage):
+    def _image_cb(self, msg: CompressedImage):
         buf   = np.frombuffer(msg.data, dtype=np.uint8)
-        frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        frame = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
         if frame is None:
             return
 
-        gray    = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        objects = self.detector.detect(frame)
-
-        if self.prev_gray is None:
-            self.prev_pts  = self.tracker.detect(gray)
-            self.prev_gray = gray
-            self._publish_debug(frame, self.prev_pts, objects)
+        kp, desc = self._orb.detectAndCompute(frame, None)
+        if desc is None or len(kp) < 8:
+            self._prev_kp, self._prev_desc = kp, desc
             return
 
-        prev_good, curr_good = self.tracker.track(self.prev_gray, gray, self.prev_pts)
-
-        R, t = self.estimator.estimate(prev_good, curr_good)
-        if R is not None:
-            self._update_pose(R, t)
-            self._add_features(curr_good)
-            self._add_objects(objects)
-            self._publish_pose(msg.header.stamp)
-
-        self._publish_map()
-
-        # Re-detect features when count drops below threshold
-        if self.tracker.needs_redetect(curr_good):
-            self.prev_pts = self.tracker.detect(gray)
-        else:
-            self.prev_pts = curr_good.reshape(-1, 1, 2)
-
-        self.prev_gray = gray
-        self._publish_debug(frame, self.prev_pts, objects)
-
-    # ------------------------------------------------------------------
-    # SLAM state updates
-    # ------------------------------------------------------------------
-
-    def _update_pose(self, R: np.ndarray, t: np.ndarray):
-        T = np.eye(4)
-        T[:3, :3] = R
-        T[:3, 3]  = t.ravel()
-        self.pose = self.pose @ np.linalg.inv(T)
-
-    def _add_features(self, pts: np.ndarray):
-        cam_pos = self.pose[:3, 3]
-        for pt in pts.reshape(-1, 2):
-            # Back-project to unit depth in camera frame, then transform to world
-            p_c = np.array([
-                (pt[0] - self.K[0, 2]) / self.K[0, 0],
-                (pt[1] - self.K[1, 2]) / self.K[1, 1],
-                1.0,
-            ])
-            p_w = self.pose[:3, :3] @ p_c + cam_pos
-            self.map_features.append(p_w.tolist())
-        if len(self.map_features) > self.MAX_MAP_FEATURES:
-            self.map_features = self.map_features[-self.MAX_MAP_FEATURES:]
-
-    def _add_objects(self, detections: List[Dict]):
-        cam_pos = self.pose[:3, 3]
-        for obj in detections:
-            px, py = obj["pixel"]
-            p_c = np.array([
-                (px - self.K[0, 2]) / self.K[0, 0],
-                (py - self.K[1, 2]) / self.K[1, 1],
-                1.0,
-            ])
-            p_w = self.pose[:3, :3] @ p_c + cam_pos
-            self.map_objects.append({"type": obj["type"], "position": p_w.tolist()})
-        if len(self.map_objects) > self.MAX_MAP_OBJECTS:
-            self.map_objects = self.map_objects[-self.MAX_MAP_OBJECTS:]
-
-    # ------------------------------------------------------------------
-    # Publishers
-    # ------------------------------------------------------------------
-
-    def _publish_pose(self, stamp):
-        msg = PoseStamped()
-        msg.header.stamp    = stamp
-        msg.header.frame_id = "map"
-        p = self.pose[:3, 3]
-        msg.pose.position.x = p[0]
-        msg.pose.position.y = p[1]
-        msg.pose.position.z = p[2]
-        q = self._rot_to_quat(self.pose[:3, :3])
-        msg.pose.orientation.x = q[0]
-        msg.pose.orientation.y = q[1]
-        msg.pose.orientation.z = q[2]
-        msg.pose.orientation.w = q[3]
-        self.pub_pose.publish(msg)
-        self._broadcast_tf(stamp)
-
-    def _broadcast_tf(self, stamp):
-        t = TransformStamped()
-        t.header.stamp    = stamp
-        t.header.frame_id = "map"
-        t.child_frame_id  = f"{self.veh}/base_link"
-        p = self.pose[:3, 3]
-        t.transform.translation.x = p[0]
-        t.transform.translation.y = p[1]
-        t.transform.translation.z = p[2]
-        q = self._rot_to_quat(self.pose[:3, :3])
-        t.transform.rotation.x = q[0]
-        t.transform.rotation.y = q[1]
-        t.transform.rotation.z = q[2]
-        t.transform.rotation.w = q[3]
-        self.tf_broadcaster.sendTransform(t)
-
-    def _publish_map(self):
-        markers = MarkerArray()
-        now = rospy.Time.now()
-
-        # Feature points as a POINTS marker (efficient single message)
-        if self.map_features:
-            m = Marker()
-            m.header.stamp    = now
-            m.header.frame_id = "map"
-            m.ns     = "features"
-            m.id     = 0
-            m.type   = Marker.POINTS
-            m.action = Marker.ADD
-            m.scale.x = 0.02
-            m.scale.y = 0.02
-            m.color   = ColorRGBA(0.2, 0.5, 1.0, 0.5)
-            for p in self.map_features[-500:]:
-                m.points.append(Point(x=p[0], y=p[1], z=p[2]))
-            markers.markers.append(m)
-
-        # Detected objects as individual sphere markers
-        for i, obj in enumerate(self.map_objects[-100:]):
-            p = obj["position"]
-            color = self._OBJ_COLORS.get(obj["type"], ColorRGBA(1.0, 1.0, 1.0, 1.0))
-            m = Marker()
-            m.header.stamp       = now
-            m.header.frame_id    = "map"
-            m.ns                 = "objects"
-            m.id                 = i + 1
-            m.type               = Marker.SPHERE
-            m.action             = Marker.ADD
-            m.pose.position.x    = p[0]
-            m.pose.position.y    = p[1]
-            m.pose.position.z    = p[2]
-            m.pose.orientation.w = 1.0
-            m.scale.x = m.scale.y = m.scale.z = 0.12
-            m.color = color
-            markers.markers.append(m)
-
-        self.pub_map.publish(markers)
-
-    def _publish_debug(self, frame: np.ndarray, pts: Optional[np.ndarray], objects: List[Dict]):
-        if self.pub_debug.get_num_connections() == 0:
+        if self._prev_kp is None or self._prev_desc is None:
+            self._prev_kp, self._prev_desc = kp, desc
             return
 
-        debug = frame.copy()
+        with self._K_lock:
+            K = self._K if self._K is not None else self._default_K
 
-        if pts is not None:
-            for pt in pts.reshape(-1, 2):
-                cv2.circle(debug, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
+        # Feature matching
+        matches = sorted(
+            self._bf.match(self._prev_desc, desc), key=lambda m: m.distance
+        )
+        if len(matches) < 8:
+            self._prev_kp, self._prev_desc = kp, desc
+            return
 
-        for obj in objects:
-            px, py  = obj["pixel"]
-            label   = obj["type"]
-            color   = self._DBG_COLORS.get(label, (255, 255, 255))
-            cv2.circle(debug, (px, py), 15, color, 2)
-            cv2.putText(debug, label, (px + 5, py - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        pts1 = np.float32([self._prev_kp[m.queryIdx].pt for m in matches])
+        pts2 = np.float32([kp[m.trainIdx].pt for m in matches])
 
-        _, enc = cv2.imencode(".jpg", debug, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        out = CompressedImage()
-        out.header.stamp = rospy.Time.now()
-        out.format = "jpeg"
-        out.data   = enc.tobytes()
-        self.pub_debug.publish(out)
+        # Fundamental matrix with RANSAC to filter outliers
+        F, mask = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC)
+        if F is None or mask is None:
+            self._prev_kp, self._prev_desc = kp, desc
+            return
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+        pts1_in = pts1[mask.ravel() == 1]
+        pts2_in = pts2[mask.ravel() == 1]
+        if len(pts1_in) < 5:
+            self._prev_kp, self._prev_desc = kp, desc
+            return
 
-    def _load_camera_matrix(self) -> np.ndarray:
-        import os, yaml
-        calib_path = f"/data/config/calibrations/camera_intrinsic/{self.veh}.yaml"
-        if os.path.exists(calib_path):
-            with open(calib_path) as f:
-                data = yaml.safe_load(f)
-            K_flat = data["camera_matrix"]["data"]
-            self.log(f"Loaded camera calibration from {calib_path}")
-            return np.array(K_flat, dtype=np.float64).reshape(3, 3)
-        self.log("No calibration file found — using default camera matrix.")
-        return self._DEFAULT_K.copy()
+        # Essential matrix → relative pose
+        E = K.T @ F @ K
+        _, R, t, _ = cv2.recoverPose(E, pts1_in, pts2_in, K)
 
-    @staticmethod
-    def _rot_to_quat(R: np.ndarray) -> np.ndarray:
-        """Rotation matrix → quaternion [x, y, z, w] via Shepperd's method."""
-        trace = R[0, 0] + R[1, 1] + R[2, 2]
-        if trace > 0:
-            s = 0.5 / np.sqrt(trace + 1.0)
-            w = 0.25 / s
-            x = (R[2, 1] - R[1, 2]) * s
-            y = (R[0, 2] - R[2, 0]) * s
-            z = (R[1, 0] - R[0, 1]) * s
-        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
-            w = (R[2, 1] - R[1, 2]) / s
-            x = 0.25 * s
-            y = (R[0, 1] + R[1, 0]) / s
-            z = (R[0, 2] + R[2, 0]) / s
-        elif R[1, 1] > R[2, 2]:
-            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
-            w = (R[0, 2] - R[2, 0]) / s
-            x = (R[0, 1] + R[1, 0]) / s
-            y = 0.25 * s
-            z = (R[1, 2] + R[2, 1]) / s
-        else:
-            s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
-            w = (R[1, 0] - R[0, 1]) / s
-            x = (R[0, 2] + R[2, 0]) / s
-            y = (R[1, 2] + R[2, 1]) / s
-            z = 0.25 * s
-        return np.array([x, y, z, w])
+        # Triangulate in the previous camera frame
+        p1_n = cv2.undistortPoints(pts1_in.reshape(-1, 1, 2), K, None).reshape(-1, 2)
+        p2_n = cv2.undistortPoints(pts2_in.reshape(-1, 1, 2), K, None).reshape(-1, 2)
+        P1 = np.hstack((np.eye(3), np.zeros((3, 1))))
+        P2 = np.hstack((R, t))
+        pts_4d = cv2.triangulatePoints(P1, P2, p1_n.T, p2_n.T).T
+
+        # Dehomogenize and discard near-zero-weight points
+        w       = pts_4d[:, 3:4]
+        valid_w = np.abs(w.ravel()) > 1e-8
+        pts_4d  = pts_4d[valid_w] / w[valid_w]
+        pts_local = pts_4d[:, :3]
+
+        # Keep only points in front of both cameras (positive depth)
+        pts_cam2 = (R @ pts_local.T + t).T
+        good      = (pts_local[:, 2] > 0) & (pts_cam2[:, 2] > 0)
+        pts_local = pts_local[good]
+
+        if len(pts_local) > 0:
+            pts_world = (self._R_cw @ pts_local.T).T + self._t_cw.T
+            with self._map_lock:
+                self._map_pts.extend(pts_world.tolist())
+                if len(self._map_pts) > self._max_pts:
+                    self._map_pts = self._map_pts[-self._max_pts:]
+            self._publish_cloud()
+
+        # Update global pose
+        R_cw_new   = self._R_cw @ R.T
+        self._t_cw = self._t_cw - R_cw_new @ t
+        self._R_cw = R_cw_new
+
+        self._prev_kp, self._prev_desc = kp, desc
+
+    def _publish_cloud(self):
+        with self._map_lock:
+            pts = np.array(self._map_pts, dtype=np.float32)
+
+        header          = std_msgs.msg.Header()
+        header.stamp    = rospy.Time.now()
+        header.frame_id = "map"
+
+        fields = [
+            PointField("x", 0, PointField.FLOAT32, 1),
+            PointField("y", 4, PointField.FLOAT32, 1),
+            PointField("z", 8, PointField.FLOAT32, 1),
+        ]
+        self._pc_pub.publish(pc2.create_cloud(header, fields, pts))
 
     def on_shutdown(self):
         super().on_shutdown()

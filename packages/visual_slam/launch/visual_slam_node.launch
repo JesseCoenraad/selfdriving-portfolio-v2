@@ -1,9 +1,22 @@
 <launch>
-    <arg name="pkg_name"  default="visual_slam"      doc="name of the package"/>
-    <arg name="node_name" default="visual_slam_node"  doc="name of the node"/>
-    <arg name="veh"       doc="Name of vehicle, e.g. megaman"/>
+    <arg name="veh" doc="Name of vehicle, e.g. myduckiebot"/>
 
-    <group ns="$(arg veh)">
-        <node pkg="$(arg pkg_name)" type="$(arg node_name).py" name="$(arg node_name)" output="screen" required="true"/>
-    </group>
+    <!-- ORB-SLAM pipeline node -->
+    <node pkg="visual_slam" type="visual_slam_node.py" name="visual_slam_node"
+          ns="$(arg veh)" output="screen">
+        <param name="image_topic"       value="/$(arg veh)/camera_node/image/compressed"/>
+        <param name="camera_info_topic" value="/$(arg veh)/camera_node/camera_info"/>
+        <param name="n_features"        type="int"    value="5000"/>
+        <param name="max_map_points"    type="int"    value="10000"/>
+        <!-- DB21 default intrinsics — overridden by camera_info when available -->
+        <rosparam param="camera_matrix">[313.8, 0.0, 321.5, 0.0, 313.8, 237.5, 0.0, 0.0, 1.0]</rosparam>
+    </node>
+
+    <!-- Point cloud visualizer node (requires DISPLAY) -->
+    <node pkg="visual_slam" type="pointcloud_visualizer_node.py" name="pointcloud_visualizer_node"
+          output="screen">
+        <param name="point_cloud_topic" value="/$(arg veh)/slam/point_cloud"/>
+        <param name="max_display_pts"   type="int"    value="8000"/>
+        <param name="point_size"        type="double" value="2.0"/>
+    </node>
 </launch>
