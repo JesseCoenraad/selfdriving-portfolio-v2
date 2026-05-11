@@ -27,11 +27,23 @@ try:
     import open3d as o3d
     _BACKEND = "open3d"
 except ImportError:
-    import matplotlib
-    matplotlib.use("TkAgg")
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-    _BACKEND = "matplotlib"
+    try:
+        import matplotlib
+        for _backend in ("Qt5Agg", "TkAgg", "GTK3Agg"):
+            try:
+                matplotlib.use(_backend)
+                import matplotlib.pyplot as plt
+                plt.figure()
+                plt.close()
+                from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+                _BACKEND = "matplotlib"
+                break
+            except Exception:
+                continue
+        else:
+            _BACKEND = "headless"
+    except ImportError:
+        _BACKEND = "headless"
 
 
 class _Open3DVisualizer:
@@ -138,9 +150,12 @@ class PointCloudVisualizerNode:
         if _BACKEND == "open3d":
             self._viz = _Open3DVisualizer(max_pts, point_size)
             rospy.loginfo("[PointCloudVisualizerNode] Using Open3D backend.")
-        else:
+        elif _BACKEND == "matplotlib":
             self._viz = _MatplotlibVisualizer(max_pts, point_size)
-            rospy.loginfo("[PointCloudVisualizerNode] Using matplotlib backend (open3d not found).")
+            rospy.loginfo("[PointCloudVisualizerNode] Using matplotlib backend.")
+        else:
+            self._viz = None
+            rospy.logwarn("[PointCloudVisualizerNode] No display available — running headless. Use RViz to visualize /slam/point_cloud.")
 
         rospy.Subscriber(
             rospy.get_param("~point_cloud_topic", "/vehicle/slam/point_cloud"),
@@ -151,11 +166,16 @@ class PointCloudVisualizerNode:
         rospy.loginfo("[PointCloudVisualizerNode] Ready.")
 
     def _callback(self, msg: PointCloud2):
+        if self._viz is None:
+            return
         raw = list(pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True))
         if raw:
             self._viz.update(np.array(raw, dtype=np.float64))
 
     def run(self):
+        if self._viz is None:
+            rospy.spin()
+            return
         rate = rospy.Rate(30)
         while not rospy.is_shutdown():
             if not self._viz.spin_once():
