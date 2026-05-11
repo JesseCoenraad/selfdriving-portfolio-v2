@@ -1,73 +1,54 @@
-# selfdriving-portfolio-v2
+# Template: template-core
 
-A ROS-based self-driving stack for Duckietown, implementing:
+This template provides a boilerplate repository
+for developing ROS-based software in Duckietown.
+Unlike the `template-ros` repository, this template
+builds on top of the module 
+[`dt-core`](https://github.com/duckietown/dt-core).
+This is needed when your application requires access 
+to tools and libraries defined in 
+[`dt-core`](https://github.com/duckietown/dt-core).
 
-- **Wheel-encoder odometry** (`encoder_pose`) — dead-reckoning pose estimation from left/right encoder ticks.
-- **Monocular visual SLAM** (`visual_slam`) — Shi-Tomasi corner tracking via Lucas-Kanade optical flow, essential-matrix motion estimation, and a live landmark map with Duckietown object detection.
 
-Built on top of [`dt-core`](https://github.com/duckietown/dt-core).
+**NOTE:** If you want to develop software that does not use
+ROS, check out [this template](https://github.com/duckietown/template-basic).
 
----
 
-## Running on a real Duckiebot
+## How to use it
 
-```bash
-dts devel run -H <hostname>.local -L slam
-```
+### 1. Fork this repository
 
----
+Use the fork button in the top-right corner of the github page to fork this template repository.
 
-## Running in the Duckiematrix (simulation)
 
-The Duckiematrix provides a simulated Duckietown environment with virtual cameras
-that publish on the same ROS topics as a real robot.
+### 2. Create a new repository
 
-### 1. Build the image for amd64
+Create a new repository on github.com while
+specifying the newly forked template repository as
+a template for your new repository.
 
-```bash
-dts devel build -a amd64
-```
 
-### 2. Start the Duckiematrix
+### 3. Define dependencies
 
-```bash
-dts matrix start
-```
+List the dependencies in the files `dependencies-apt.txt` and
+`dependencies-py3.txt` (apt packages and pip packages respectively).
 
-### 3. Run the container against the simulator
 
-```bash
-dts devel run -a amd64 -L slam --sim
-```
+### 4. Place your code
 
----
+Place your code in the directory `/packages/` of
+your new repository.
 
-## Packages
 
-| Package | Launcher | Description |
-|---|---|---|
-| `encoder_pose` | `odometry` | Dead-reckoning pose from wheel encoders |
-| `visual_slam` | `slam` | Monocular SLAM with feature tracking and object detection |
+### 5. Setup launchers
 
-The default launcher runs both nodes together.
+The directory `/launchers` can contain as many launchers (launching scripts)
+as you want. A default launcher called `default.sh` must always be present.
 
----
+If you create an executable script (i.e., a file with a valid shebang statement)
+a launcher will be created for it. For example, the script file 
+`/launchers/my-launcher.sh` will be available inside the Docker image as the binary
+`dt-launcher-my-launcher`.
 
-## ROS topics
-
-### encoder_pose
-
-| Direction | Topic | Type |
-|---|---|---|
-| Sub | `/<veh>/left_wheel_encoder_driver_node/tick` | `WheelEncoderStamped` |
-| Sub | `/<veh>/right_wheel_encoder_driver_node/tick` | `WheelEncoderStamped` |
-| Pub | `/<veh>/pose` | `Odometry` |
-
-### visual_slam
-
-| Direction | Topic | Type |
-|---|---|---|
-| Sub | `/<veh>/camera_node/image/compressed` | `CompressedImage` |
-| Pub | `/<veh>/slam/pose` | `PoseStamped` |
-| Pub | `/<veh>/slam/map` | `MarkerArray` |
-| Pub | `/<veh>/slam/debug/image/compressed` | `CompressedImage` |
+When launching a new container, you can simply provide `dt-launcher-my-launcher` as
+command.
