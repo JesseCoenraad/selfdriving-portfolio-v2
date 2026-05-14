@@ -7,7 +7,7 @@ import numpy as np
 import rospy
 import std_msgs.msg
 from duckietown.dtros import DTROS, NodeType
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, PoseStamped
 from sensor_msgs import point_cloud2 as pc2
 from sensor_msgs.msg import CameraInfo, CompressedImage, PointCloud2, PointField
 from std_msgs.msg import ColorRGBA
@@ -98,6 +98,9 @@ class VisualSlamNode(DTROS):
         )
         self._debug_pub = rospy.Publisher(
             f"/{self.veh}/slam/debug/image/compressed", CompressedImage, queue_size=1
+        )
+        self._pose_pub  = rospy.Publisher(
+            f"/{self.veh}/slam/pose", PoseStamped, queue_size=1
         )
 
         rospy.Subscriber(
@@ -223,6 +226,7 @@ class VisualSlamNode(DTROS):
         self._t_cw = self._t_cw - R_cw_new @ t
         self._R_cw = R_cw_new
 
+        self._publish_slam_pose(msg.header.stamp)
         self._prev_kp, self._prev_desc = kp, desc
 
     def _detect_objects(self, frame_bgr: np.ndarray) -> list:
@@ -282,6 +286,18 @@ class VisualSlamNode(DTROS):
             m.color  = color
             markers.markers.append(m)
         self._obj_pub.publish(markers)
+
+    def _publish_slam_pose(self, stamp):
+        yaw = np.arctan2(self._R_cw[1, 0], self._R_cw[0, 0])
+        msg = PoseStamped()
+        msg.header.stamp    = stamp
+        msg.header.frame_id = "map"
+        msg.pose.position.x = float(self._t_cw[0])
+        msg.pose.position.y = float(self._t_cw[1])
+        msg.pose.position.z = float(self._t_cw[2])
+        msg.pose.orientation.z = np.sin(yaw / 2)
+        msg.pose.orientation.w = np.cos(yaw / 2)
+        self._pose_pub.publish(msg)
 
     def _publish_debug(self, frame_bgr: np.ndarray, kp, objects: list):
         if self._debug_pub.get_num_connections() == 0:

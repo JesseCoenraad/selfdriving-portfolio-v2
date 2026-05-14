@@ -1,0 +1,8 @@
+<launch>
+    <arg name="veh" doc="Name of vehicle, e.g. myduckiebot"/>
+
+    <group ns="$(arg veh)">
+        <node pkg="sensor_fusion" type="sensor_fusion_node.py"
+              name="sensor_fusion_node" output="screen" required="true"/>
+    </group>
+</launch>
