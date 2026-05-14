@@ -90,11 +90,14 @@ class VisualSlamNode(DTROS):
 
         self._map_objects: list = []
 
-        self._pc_pub  = rospy.Publisher(
+        self._pc_pub    = rospy.Publisher(
             f"/{self.veh}/slam/point_cloud", PointCloud2, queue_size=1
         )
-        self._obj_pub = rospy.Publisher(
+        self._obj_pub   = rospy.Publisher(
             f"/{self.veh}/slam/objects", MarkerArray, queue_size=1
+        )
+        self._debug_pub = rospy.Publisher(
+            f"/{self.veh}/slam/debug/image/compressed", CompressedImage, queue_size=1
         )
 
         rospy.Subscriber(
@@ -136,6 +139,8 @@ class VisualSlamNode(DTROS):
             self._publish_objects()
 
         kp, desc = self._orb.detectAndCompute(frame, None)
+        self._publish_debug(frame_bgr, kp, objects)
+
         if desc is None or len(kp) < 8:
             self._prev_kp, self._prev_desc = kp, desc
             return
@@ -277,6 +282,37 @@ class VisualSlamNode(DTROS):
             m.color  = color
             markers.markers.append(m)
         self._obj_pub.publish(markers)
+
+    def _publish_debug(self, frame_bgr: np.ndarray, kp, objects: list):
+        if self._debug_pub.get_num_connections() == 0:
+            return
+        debug = frame_bgr.copy()
+
+        # ORB keypoints — groene cirkels met oriëntatie en schaal
+        if kp:
+            for p in kp:
+                x, y = int(p.pt[0]), int(p.pt[1])
+                cv2.circle(debug, (x, y), 2, (0, 255, 0), -1)
+
+        colors_bgr = {
+            "duckie":              (0,   255, 255),
+            "traffic_light_red":   (0,   0,   255),
+            "traffic_light_green": (0,   255, 0  ),
+            "duckiebot":           (255, 0,   0  ),
+        }
+        for obj in objects:
+            px, py = obj["pixel"]
+            label  = obj["type"]
+            color  = colors_bgr.get(label, (255, 255, 255))
+            cv2.circle(debug, (px, py), 20, color, 2)
+            cv2.putText(debug, label, (px + 5, py - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        _, enc = cv2.imencode(".jpg", debug, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        msg        = CompressedImage()
+        msg.header.stamp = rospy.Time.now()
+        msg.format = "jpeg"
+        msg.data   = enc.tobytes()
+        self._debug_pub.publish(msg)
 
     def _publish_cloud(self):
         with self._map_lock:

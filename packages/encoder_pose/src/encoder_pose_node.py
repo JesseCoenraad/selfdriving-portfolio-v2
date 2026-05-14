@@ -7,7 +7,8 @@ import numpy as np
 import rospy
 from duckietown.dtros import DTROS, NodeType, TopicType
 from duckietown_msgs.msg import WheelEncoderStamped
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry, Path
 
 from encoder_pose.include.odometry.odometry import delta_phi, estimate_pose
 
@@ -56,6 +57,13 @@ class EncoderPoseNode(DTROS):
             queue_size=1,
             dt_topic_type=TopicType.LOCALIZATION,
         )
+        self.pub_path = rospy.Publisher(
+            f"/{self.veh}/odometry/path",
+            Path,
+            queue_size=1,
+        )
+        self._path = Path()
+        self._path.header.frame_id = "map"
 
         rospy.Timer(rospy.Duration(0.5), self.publish_pose)
         self.log("Initialized.")
@@ -130,6 +138,14 @@ class EncoderPoseNode(DTROS):
                 odom.pose.pose.orientation.w = np.cos(theta / 2)
 
                 self.pub_pose.publish(odom)
+
+                pose_stamped = PoseStamped()
+                pose_stamped.header.frame_id = "map"
+                pose_stamped.header.stamp = odom.header.stamp
+                pose_stamped.pose = odom.pose.pose
+                self._path.header.stamp = odom.header.stamp
+                self._path.poses.append(pose_stamped)
+                self.pub_path.publish(self._path)
 
     @staticmethod
     def _clamp_angle(theta: float) -> float:

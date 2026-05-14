@@ -1,0 +1,11 @@
+<launch>
+    <arg name="veh" doc="Name of vehicle, e.g. myduckiebot"/>
+
+    <include file="$(find encoder_pose)/launch/encoder_pose_node.launch">
+        <arg name="veh" value="$(arg veh)"/>
+    </include>
+
+    <include file="$(find visual_slam)/launch/visual_slam_node.launch">
+        <arg name="veh" value="$(arg veh)"/>
+    </include>
+</launch>
